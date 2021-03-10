@@ -377,7 +377,7 @@ class Yolo_dataset(Dataset):
                 # print(img_path)
         if len(out_bboxes) == 0:
             out_bboxes = np.empty((0, 5))
-        if use_mixup == 3:
+        elif use_mixup == 3:
             out_bboxes = np.concatenate(out_bboxes, axis=0)
 
         out_bboxes1 = np.zeros([self.cfg.boxes, 5])
