@@ -139,6 +139,9 @@ class Yolo_loss(nn.Module):
         truth_i_all = truth_x_all.to(torch.int16).cpu().numpy()
         truth_j_all = truth_y_all.to(torch.int16).cpu().numpy()
 
+        # total blueberries detected vs actual
+        batch_detected = 0
+        batch_actual = 0
         for b in range(batchsize):
             n = int(nlabel[b])
             if n == 0:
@@ -163,10 +166,22 @@ class Yolo_loss(nn.Module):
             truth_box[:n, 0] = truth_x_all[b, :n]
             truth_box[:n, 1] = truth_y_all[b, :n]
 
+            true_positives = 0
+            false_positives = 0
+            
             pred_ious = bboxes_iou(pred[b].view(-1, 4), truth_box, xyxy=False)
             pred_best_iou, _ = pred_ious.max(dim=1)
+
+            # calculate detected blueberries vs actual blueberries
+            bb_detected = pred_best_iou
+            bb_detected = pred_best_iou[pred_best_iou > self.ignore_thre]
+            batch_detected += bb_detected.shape[0]
+            batch_actual += truth_box.shape[0]
+
             pred_best_iou = (pred_best_iou > self.ignore_thre)
             pred_best_iou = pred_best_iou.view(pred[b].shape[:3])
+
+            
             # set mask to zero (ignore) if pred matches truth
             obj_mask[b] = ~ pred_best_iou
 
@@ -185,11 +200,14 @@ class Yolo_loss(nn.Module):
                     target[b, a, j, i, 4] = 1
                     target[b, a, j, i, 5 + labels[b, ti, 4].to(torch.int16).cpu().numpy()] = 1
                     tgt_scale[b, a, j, i, :] = torch.sqrt(2 - truth_w_all[b, ti] * truth_h_all[b, ti] / fsize / fsize)
-        return obj_mask, tgt_mask, tgt_scale, target
+        bbcount = (batch_detected, batch_actual)
+        return obj_mask, tgt_mask, tgt_scale, target, bbcount
 
     def forward(self, xin, labels=None):
-        loss, loss_xy, loss_wh, loss_obj, loss_cls, loss_l2 = 0, 0, 0, 0, 0, 0
+        loss, loss_xy, loss_wh, loss_obj, loss_cls, loss_l2, bbratio = 0, 0, 0, 0, 0, 0, 0
+        count = 0
         for output_id, output in enumerate(xin):
+            count += 1
             batchsize = output.shape[0]
             fsize = output.shape[2]
             n_ch = 5 + self.n_classes
@@ -206,7 +224,7 @@ class Yolo_loss(nn.Module):
             pred[..., 2] = torch.exp(pred[..., 2]) * self.anchor_w[output_id]
             pred[..., 3] = torch.exp(pred[..., 3]) * self.anchor_h[output_id]
 
-            obj_mask, tgt_mask, tgt_scale, target = self.build_target(pred, labels, batchsize, fsize, n_ch, output_id)
+            obj_mask, tgt_mask, tgt_scale, target, bbcount = self.build_target(pred, labels, batchsize, fsize, n_ch, output_id)
 
             # loss calculation
             output[..., 4] *= obj_mask
@@ -224,9 +242,15 @@ class Yolo_loss(nn.Module):
             loss_cls += F.binary_cross_entropy(input=output[..., 5:], target=target[..., 5:], size_average=False)
             loss_l2 += F.mse_loss(input=output, target=target, size_average=False)
 
+            if bbcount[1] > 0:
+                bbratio += bbcount[0]/bbcount[1]
+
         loss = loss_xy + loss_wh + loss_obj + loss_cls
 
-        return loss, loss_xy, loss_wh, loss_obj, loss_cls, loss_l2
+        if count < 0:
+            bbratio = bbratio / count # average
+
+        return loss, loss_xy, loss_wh, loss_obj, loss_cls, loss_l2, bbratio
 
 
 def collate(batch):
@@ -308,9 +332,13 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
 
     for epoch in range(epochs):
         current_epoch += 1
+
         epoch_training_loss = 0
+        epoch_training_bbratio = 0
         epoch_training_step = 0
+
         epoch_val_loss = 0
+        epoch_val_bbratio = 0
         epoch_val_step = 0
         for phase in ['train', 'val']:
             if phase == 'train':
@@ -318,6 +346,7 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
             else:
                 model.eval()
             if phase == 'train':
+                model.train()
                 with tqdm(total=n_train, desc=f'Epoch {epoch + 1}/{epochs}', unit='img', ncols=50) as pbar:
                     for i, batch in enumerate(train_loader):
                         global_step += 1
@@ -329,11 +358,14 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                         bboxes = bboxes.to(device=device)
 
                         bboxes_pred = model(images)
-                        loss, loss_xy, loss_wh, loss_obj, loss_cls, loss_l2 = criterion(bboxes_pred, bboxes)
+
+                        loss, loss_xy, loss_wh, loss_obj, loss_cls, loss_l2, bbratio = criterion(bboxes_pred, bboxes)
                         # loss = loss / config.subdivisions
                         loss.backward()
 
+                        # add to average
                         epoch_training_loss += loss.item()
+                        epoch_training_bbratio += bbratio
 
                         if global_step  % config.subdivisions == 0:
                             optimizer.step()
@@ -375,6 +407,7 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                         torch.save(model.state_dict(), os.path.join(config.checkpoints, f'Yolov4_epoch{epoch + 1}.pth'))
                         logging.info(f'Checkpoint {epoch + 1} saved !')
             else:
+                model.eval()
                 for i, batch in enumerate(val_loader):
                     epoch_val_step += 1
                     images = batch[0]
@@ -384,12 +417,15 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                     bboxes = bboxes.to(device=device)
 
                     bboxes_pred = model(images)
-                    loss, loss_xy, loss_wh, loss_obj, loss_cls, loss_l2 = criterion(bboxes_pred, bboxes)
-                    loss.backward()
+                    loss, loss_xy, loss_wh, loss_obj, loss_cls, loss_l2, bbratio = criterion(bboxes_pred, bboxes)
+
+                    # add to average
                     epoch_val_loss += loss.item()
+                    epoch_val_bbratio += bbratio
         writer.add_scalar('epoch_training/Loss', epoch_training_loss/epoch_training_step, current_epoch)
         writer.add_scalar('epoch_val/Loss', epoch_val_loss/epoch_val_step, current_epoch)
-        logging.info('Epoch: {}, Training loss: {}, Validation loss: {}'.format(current_epoch, epoch_training_loss/epoch_training_step, epoch_val_loss/epoch_val_step))
+        logging.info('Epoch: {}, Training loss: {}, Validation loss: {}, Training ratio: {}, Validation ratio: {}'
+        .format(current_epoch, epoch_training_loss/epoch_training_step, epoch_val_loss/epoch_val_step, epoch_training_bbratio/epoch_training_step, epoch_val_bbratio/epoch_val_step))
     writer.close()
 
 
