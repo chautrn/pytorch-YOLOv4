@@ -247,6 +247,7 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
     train_dataset = Yolo_dataset(config.train_label, config)
     val_dataset = Yolo_dataset(config.val_label, config)
 
+
     n_train = len(train_dataset)
     n_val = len(val_dataset)
 
@@ -254,7 +255,9 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                               num_workers=8, pin_memory=True, drop_last=True, collate_fn=collate)
 
     val_loader = DataLoader(val_dataset, batch_size=config.batch // config.subdivisions, shuffle=True, num_workers=8,
-                            pin_memory=True, drop_last=True)
+                            pin_memory=True, drop_last=True, collate_fn=collate)
+
+    print(len(val_loader.dataset))
 
     writer = SummaryWriter(log_dir=config.TRAIN_TENSORBOARD_DIR,
                            filename_suffix=f'OPT_{config.TRAIN_OPTIMIZER}_LR_{config.learning_rate}_BS_{config.batch}_Sub_{config.subdivisions}_Size_{config.width}',
@@ -278,6 +281,7 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
         Optimizer:       {config.TRAIN_OPTIMIZER}
         Dataset classes: {config.classes}
         Train label path:{config.train_label}
+        Train label path:{config.val_label}
         Pretrained:
     ''')
 
@@ -300,69 +304,92 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
     # scheduler = ReduceLROnPlateau(optimizer, mode='max', verbose=True, patience=6, min_lr=1e-7)
     # scheduler = CosineAnnealingWarmRestarts(optimizer, 0.001, 1e-6, 20)
 
-    model.train()
+    current_epoch = 0
+
     for epoch in range(epochs):
-        #model.train()
-        epoch_loss = 0
-        epoch_step = 0
+        current_epoch += 1
+        epoch_training_loss = 0
+        epoch_training_step = 0
+        epoch_val_loss = 0
+        epoch_val_step = 0
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                model.train()
+            else:
+                model.eval()
+            if phase == 'train':
+                with tqdm(total=n_train, desc=f'Epoch {epoch + 1}/{epochs}', unit='img', ncols=50) as pbar:
+                    for i, batch in enumerate(train_loader):
+                        global_step += 1
+                        epoch_training_step += 1
+                        images = batch[0]
+                        bboxes = batch[1]
 
-        with tqdm(total=n_train, desc=f'Epoch {epoch + 1}/{epochs}', unit='img', ncols=50) as pbar:
-            for i, batch in enumerate(train_loader):
-                global_step += 1
-                epoch_step += 1
-                images = batch[0]
-                bboxes = batch[1]
+                        images = images.to(device=device, dtype=torch.float32)
+                        bboxes = bboxes.to(device=device)
 
-                images = images.to(device=device, dtype=torch.float32)
-                bboxes = bboxes.to(device=device)
+                        bboxes_pred = model(images)
+                        loss, loss_xy, loss_wh, loss_obj, loss_cls, loss_l2 = criterion(bboxes_pred, bboxes)
+                        # loss = loss / config.subdivisions
+                        loss.backward()
 
-                bboxes_pred = model(images)
-                loss, loss_xy, loss_wh, loss_obj, loss_cls, loss_l2 = criterion(bboxes_pred, bboxes)
-                # loss = loss / config.subdivisions
-                loss.backward()
+                        epoch_training_loss += loss.item()
 
-                epoch_loss += loss.item()
+                        if global_step  % config.subdivisions == 0:
+                            optimizer.step()
+                            scheduler.step()
+                            model.zero_grad()
 
-                if global_step  % config.subdivisions == 0:
-                    optimizer.step()
-                    scheduler.step()
-                    model.zero_grad()
+                        if global_step % (log_step * config.subdivisions) == 0:
+                            writer.add_scalar('train/Loss', loss.item(), global_step)
+                            writer.add_scalar('train/loss_xy', loss_xy.item(), global_step)
+                            writer.add_scalar('train/loss_wh', loss_wh.item(), global_step)
+                            writer.add_scalar('train/loss_obj', loss_obj.item(), global_step)
+                            writer.add_scalar('train/loss_cls', loss_cls.item(), global_step)
+                            writer.add_scalar('train/loss_l2', loss_l2.item(), global_step)
+                            writer.add_scalar('lr', scheduler.get_lr()[0] * config.batch, global_step)
+                            '''
+                            pbar.set_postfix({'loss (batch)': loss.item(), 'loss_xy': loss_xy.item(),
+                                                'loss_wh': loss_wh.item(),
+                                                'loss_obj': loss_obj.item(),
+                                                'loss_cls': loss_cls.item(),
+                                                'loss_l2': loss_l2.item(),
+                                                'lr': scheduler.get_lr()[0] * config.batch
+                                                })
+                            '''
+                            logging.info('Train step_{}: loss : {},loss xy : {},loss wh : {},'
+                                        'loss obj : {}，loss cls : {},loss l2 : {},lr : {}'
+                                        .format(global_step, loss.item(), loss_xy.item(),
+                                                loss_wh.item(), loss_obj.item(),
+                                                loss_cls.item(), loss_l2.item(),
+                                                scheduler.get_lr()[0] * config.batch))
 
-                if global_step % (log_step * config.subdivisions) == 0:
-                    writer.add_scalar('train/Loss', loss.item(), global_step)
-                    writer.add_scalar('train/loss_xy', loss_xy.item(), global_step)
-                    writer.add_scalar('train/loss_wh', loss_wh.item(), global_step)
-                    writer.add_scalar('train/loss_obj', loss_obj.item(), global_step)
-                    writer.add_scalar('train/loss_cls', loss_cls.item(), global_step)
-                    writer.add_scalar('train/loss_l2', loss_l2.item(), global_step)
-                    writer.add_scalar('lr', scheduler.get_lr()[0] * config.batch, global_step)
-                    '''
-                    pbar.set_postfix({'loss (batch)': loss.item(), 'loss_xy': loss_xy.item(),
-                                        'loss_wh': loss_wh.item(),
-                                        'loss_obj': loss_obj.item(),
-                                        'loss_cls': loss_cls.item(),
-                                        'loss_l2': loss_l2.item(),
-                                        'lr': scheduler.get_lr()[0] * config.batch
-                                        })
-                    '''
-                    logging.info('Train step_{}: loss : {},loss xy : {},loss wh : {},'
-                                  'loss obj : {}，loss cls : {},loss l2 : {},lr : {}'
-                                  .format(global_step, loss.item(), loss_xy.item(),
-                                          loss_wh.item(), loss_obj.item(),
-                                          loss_cls.item(), loss_l2.item(),
-                                          scheduler.get_lr()[0] * config.batch))
+                        pbar.update(images.shape[0])
 
-                pbar.update(images.shape[0])
+                    if save_cp:
+                        try:
+                            os.mkdir(config.checkpoints)
+                            logging.info('Created checkpoint directory')
+                        except OSError:
+                            pass
+                        torch.save(model.state_dict(), os.path.join(config.checkpoints, f'Yolov4_epoch{epoch + 1}.pth'))
+                        logging.info(f'Checkpoint {epoch + 1} saved !')
+            else:
+                for i, batch in enumerate(val_loader):
+                    epoch_val_step += 1
+                    images = batch[0]
+                    bboxes = batch[1]
 
-            if save_cp:
-                try:
-                    os.mkdir(config.checkpoints)
-                    logging.info('Created checkpoint directory')
-                except OSError:
-                    pass
-                torch.save(model.state_dict(), os.path.join(config.checkpoints, f'Yolov4_epoch{epoch + 1}.pth'))
-                logging.info(f'Checkpoint {epoch + 1} saved !')
+                    images = images.to(device=device, dtype=torch.float32)
+                    bboxes = bboxes.to(device=device)
 
+                    bboxes_pred = model(images)
+                    loss, loss_xy, loss_wh, loss_obj, loss_cls, loss_l2 = criterion(bboxes_pred, bboxes)
+                    loss.backward()
+                    epoch_val_loss += loss.item()
+        writer.add_scalar('epoch_training/Loss', epoch_training_loss/epoch_training_step, current_epoch)
+        writer.add_scalar('epoch_val/Loss', epoch_val_loss/epoch_val_step, current_epoch)
+        logging.info('Epoch: {}, Training loss: {}, Validation loss: {}'.format(current_epoch, epoch_training_loss/epoch_training_step, epoch_val_loss/epoch_val_step))
     writer.close()
 
 
@@ -383,6 +410,7 @@ def get_args(**kwargs):
     parser.add_argument('-pretrained',type=str,default=None,help='pretrained yolov4.conv.137')
     parser.add_argument('-classes',type=int,default=80,help='dataset classes')
     parser.add_argument('-train_label_path',dest='train_label',type=str,default='train.txt',help="train label path")
+    parser.add_argument('-val_label_path',dest='val_label',type=str,default='val.txt',help="validation label path")
     parser.add_argument('-epochs',dest='TRAIN_EPOCHS',type=int,default=10,help="number of training epochs")
     args = vars(parser.parse_args())
 
